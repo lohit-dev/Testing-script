@@ -1,8 +1,6 @@
 //cargo run --release --bin testing_script
 use breez_sdk_spark::{
-    connect, default_config, BreezSdk, ConnectRequest, GetInfoRequest, Network,
-    PrepareSendPaymentRequest, ReceivePaymentMethod, ReceivePaymentRequest, Seed,
-    SendPaymentRequest,
+    BreezSdk, Config, ConnectRequest, GetInfoRequest, Network, PrepareSendPaymentRequest, ReceivePaymentMethod, ReceivePaymentRequest, Seed, SendPaymentRequest, connect, default_config
 };
 use color_eyre::eyre::{eyre, Result};
 use ethers::{
@@ -328,8 +326,9 @@ async fn main() -> Result<()> {
 
     // ── Uncomment the test you want to run ───────────────────────
 
-    // Single order tests (500 sats / 500 wbtc)
+    // Single order tests (Spark->EVM: 5->4 sats, EVM->Spark: 100->99 units)
     // test_single_evm_to_spark().await?;
+    // test_single_spark_to_evm().await?;
     // for i in 0..100 {
     // test_single_spark_to_evm().await?;
     // }
@@ -340,9 +339,9 @@ async fn main() -> Result<()> {
 
     // Batch stress tests
     // Spark -> Arbitrum Sepolia: source 5 sats, destination 4 sats
-    batch_test_spark_to_evm(250, 3).await?;
+    batch_test_spark_to_evm(100, 3).await?;
     // Arbitrum Sepolia -> Spark: source 100, destination 99
-    batch_test_evm_to_spark(250, 3).await?;
+    batch_test_evm_to_spark(100, 3).await?;
 
     // batch_test_solana_to_spark(500, 10).await?;
     // or
@@ -352,12 +351,12 @@ async fn main() -> Result<()> {
 }
 
 // ============================================================================
-// SINGLE ORDER: SPARK → EVM  (500 sats)
+// SINGLE ORDER: SPARK → EVM  (5 sats -> 4 sats)
 // ============================================================================
 
 #[allow(dead_code)]
 async fn test_single_spark_to_evm() -> Result<()> {
-    info!("=== Single Order: Spark → EVM (500 sats) ===");
+    info!("=== Single Order: Spark → EVM (5 sats -> 4 sats) ===");
 
     // 1. Init SDK
     let sdk = init_sdk().await?;
@@ -407,12 +406,12 @@ async fn test_single_spark_to_evm() -> Result<()> {
 }
 
 // ============================================================================
-// SINGLE ORDER: EVM (WBTC) → SPARK  (500 wbtc units)
+// SINGLE ORDER: EVM (WBTC) → SPARK  (100 -> 99 units)
 // ============================================================================
 
 #[allow(dead_code)]
 async fn test_single_evm_to_spark() -> Result<()> {
-    info!("=== Single Order: EVM → Spark (500 WBTC) ===");
+    info!("=== Single Order: EVM → Spark (100 -> 99 units) ===");
 
     // 1. Init SDK for Spark address
     let sdk = init_sdk().await?;
@@ -475,14 +474,14 @@ async fn test_single_evm_to_spark() -> Result<()> {
 }
 
 // ============================================================================
-// BATCH TEST: SPARK → EVM  (500 orders × 500 sats)
+// BATCH TEST: SPARK → EVM  (N orders × 5 sats -> 4 sats)
 // ============================================================================
 
 #[allow(dead_code)]
 async fn batch_test_spark_to_evm(total_orders: u32, batch_size: u32) -> Result<BatchTestReport> {
     info!("=== Starting Batch Test: Spark → EVM ===");
     info!(
-        "Total orders: {}, Batch size: {}, Amount: 500 sats each",
+        "Total orders: {}, Batch size: {}, Amount: 5 sats -> 4 sats each",
         total_orders, batch_size
     );
 
@@ -603,20 +602,20 @@ async fn batch_test_spark_to_evm(total_orders: u32, batch_size: u32) -> Result<B
     }
 
     report.finish();
-    report.print_report("Spark → EVM (500 sats × 500 orders)");
+    report.print_report("Spark → EVM (5->4 sats per order)");
     info!("=== Batch Test Complete: Spark → EVM ===");
     Ok(report)
 }
 
 // ============================================================================
-// BATCH TEST: EVM (WBTC) → SPARK  (500 orders × 500 wbtc)
+// BATCH TEST: EVM (WBTC) → SPARK  (N orders × 100 -> 99 units)
 // ============================================================================
 
 #[allow(dead_code)]
 async fn batch_test_evm_to_spark(total_orders: u32, batch_size: u32) -> Result<BatchTestReport> {
     info!("=== Starting Batch Test: EVM → Spark ===");
     info!(
-        "Total orders: {}, Batch size: {}, Amount: 500 WBTC each",
+        "Total orders: {}, Batch size: {}, Amount: 100 -> 99 units each",
         total_orders, batch_size
     );
 
@@ -748,7 +747,7 @@ async fn batch_test_evm_to_spark(total_orders: u32, batch_size: u32) -> Result<B
     }
 
     report.finish();
-    report.print_report("EVM → Spark (500 WBTC × 500 orders)");
+    report.print_report("EVM → Spark (100->99 units per order)");
     info!("=== Batch Test Complete: EVM → Spark ===");
     Ok(report)
 }
@@ -760,8 +759,10 @@ async fn batch_test_evm_to_spark(total_orders: u32, batch_size: u32) -> Result<B
 async fn init_sdk() -> Result<BreezSdk> {
     info!("Initializing SDK...");
     let storage_dir = env_var("STORAGE_DIR")?;
+    let breez_api_key = env_var("BREEZ_API_KEY")?;
     std::fs::create_dir_all(&storage_dir)?;
-    let config = default_config(Network::Regtest);
+    let mut config: Config = default_config(Network::Mainnet);
+    config.api_key = Some(breez_api_key);
     let seed = Seed::Mnemonic {
         mnemonic: env_var("TEST_MNEMONIC")?,
         passphrase: None,
@@ -779,7 +780,7 @@ async fn init_sdk() -> Result<BreezSdk> {
 async fn get_address(sdk: &BreezSdk) -> Result<String> {
     let info = sdk
         .get_info(GetInfoRequest {
-            ensure_synced: Some(true),
+            ensure_synced: Some(false),
         })
         .await?;
     info!("Balance: {} sats", info.balance_sats);
@@ -798,6 +799,8 @@ async fn send_funds(sdk: &BreezSdk, dest: &str, amount: u64) -> Result<()> {
         payment_request: dest.to_string(),
         amount: Some(amount as u128),
         token_identifier: None,
+        conversion_options: None,
+        fee_policy: None,
     };
     let prepare_response = sdk.prepare_send_payment(prepare_request).await?;
     info!("Payment prepared successfully");
@@ -914,7 +917,7 @@ async fn create_order_spark_to_evm(
             owner: dest_owner.to_string(),
             amount: dest_amount,
         },
-        solver_id: None,
+        solver_id: Some("staging-2".to_string()),
     };
     let (status, res_text) = make_order_request_with_retry(&client, &url, &req, 5).await?;
     if !status.is_success() {
@@ -958,7 +961,7 @@ async fn create_order_evm_to_spark(
             owner: dest_owner.to_string(),
             amount: dest_amount.to_string(),
         },
-        solver_id: None,
+        solver_id: Some("staging-2".to_string()),
     };
     info!("Creating order with request: {:?}", req);
     let (status, res_text) = make_order_request_with_retry(&client, &url, &req, 5).await?;
@@ -1512,7 +1515,7 @@ async fn create_order_solana_to_spark(
             owner: dest_owner.to_string(),
             amount: dest_amount.to_string(),
         },
-        solver_id: None,
+        solver_id: Some("staging-2".to_string()),
     };
 
     info!("Order request: {:?}", req);
@@ -1668,11 +1671,10 @@ async fn test_solana_cbbtc_to_spark() -> Result<()> {
 
 #[allow(dead_code)]
 async fn batch_test_spark_to_solana(total_orders: u32, batch_size: u32) -> Result<BatchTestReport> {
-    use base64::Engine;
-    use solana_client::nonblocking::rpc_client::RpcClient as SolanaRpcClient;
+    
+    
     use solana_sdk::{
-        commitment_config::CommitmentConfig, signature::Keypair, signer::Signer as SolanaSigner,
-        transaction::VersionedTransaction,
+        signature::Keypair, signer::Signer as SolanaSigner,
     };
 
     info!("=== Starting Batch Test: Spark → Solana ===");
@@ -1856,7 +1858,7 @@ async fn create_order_spark_to_solana(
             owner: dest_owner.to_string(),
             amount: dest_amount,
         },
-        solver_id: None,
+        solver_id: Some("staging-2".to_string()),
     };
     let (status, res_text) = make_order_request_with_retry(&client, &url, &req, 5).await?;
     if !status.is_success() {

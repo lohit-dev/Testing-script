@@ -1,9 +1,7 @@
 //RUST_LOG=info cargo run --release --bin flood_test
 //cargo run --release
 use breez_sdk_spark::{
-    connect, default_config, BreezSdk, ConnectRequest, GetInfoRequest, Network,
-    PrepareSendPaymentRequest, ReceivePaymentMethod, ReceivePaymentRequest, Seed,
-    SendPaymentRequest,
+    BreezSdk, Config, ConnectRequest, GetInfoRequest, Network, PrepareSendPaymentRequest, ReceivePaymentMethod, ReceivePaymentRequest, Seed, SendPaymentRequest, connect, default_config
 };
 use color_eyre::eyre::{eyre, Result};
 use ethers::{
@@ -335,7 +333,7 @@ async fn main() -> Result<()> {
 async fn flood_spark_to_evm() -> Result<()> {
     info!("═══════════════════════════════════════════════════════════════");
     info!("  FLOOD TEST: Spark → EVM");
-    info!("  {} orders × 500 sats", FLOOD_TOTAL_ORDERS);
+    info!("  {} orders × 5 sats", FLOOD_TOTAL_ORDERS);
     info!(
         "  Phase 1: Slow create ({} orders/batch, {}ms between, {}ms batch pause)",
         FLOOD_CREATE_BATCH_SIZE, FLOOD_CREATE_DELAY_MS, FLOOD_CREATE_BATCH_PAUSE_MS
@@ -351,7 +349,7 @@ async fn flood_spark_to_evm() -> Result<()> {
     info!("═══════════════════════════════════════════════════════════════");
 
     let total_start = Instant::now();
-    let mut report = FloodReport::new("Spark → EVM (500 sats)");
+    let mut report = FloodReport::new("Spark → EVM (5 sats)");
 
     // Init SDK
     let sdk = Arc::new(init_sdk().await?);
@@ -578,7 +576,7 @@ async fn flood_spark_to_evm() -> Result<()> {
 }
 
 // ============================================================================
-// FLOOD TEST: EVM (WBTC) → SPARK
+// FLOOD TEST: EVM (WBTC) → SPARK (100 -> 99 units)
 //
 // Phase 1: Slowly create 500 orders (respecting rate limits)
 // Phase 2: Fill ALL 500 orders at once (blast EVM txs concurrently)
@@ -589,7 +587,7 @@ async fn flood_spark_to_evm() -> Result<()> {
 async fn flood_evm_to_spark() -> Result<()> {
     info!("═══════════════════════════════════════════════════════════════");
     info!("  FLOOD TEST: EVM (WBTC) → Spark");
-    info!("  {} orders × 500 WBTC", FLOOD_TOTAL_ORDERS);
+    info!("  {} orders × 100 -> 99 units", FLOOD_TOTAL_ORDERS);
     info!(
         "  Phase 1: Slow create ({} orders/batch, {}ms between, {}ms batch pause)",
         FLOOD_CREATE_BATCH_SIZE, FLOOD_CREATE_DELAY_MS, FLOOD_CREATE_BATCH_PAUSE_MS
@@ -605,7 +603,7 @@ async fn flood_evm_to_spark() -> Result<()> {
     info!("═══════════════════════════════════════════════════════════════");
 
     let total_start = Instant::now();
-    let mut report = FloodReport::new("EVM (WBTC) → Spark (500 units)");
+    let mut report = FloodReport::new("EVM (WBTC) → Spark (100 -> 99 units)");
 
     // Init SDK
     let sdk = init_sdk().await?;
@@ -849,8 +847,10 @@ async fn flood_evm_to_spark() -> Result<()> {
 async fn init_sdk() -> Result<BreezSdk> {
     info!("Initializing SDK...");
     let storage_dir = env_var("STORAGE_DIR")?;
+    let breez_api_key = env_var("BREEZ_API_KEY")?;
     std::fs::create_dir_all(&storage_dir)?;
-    let config = default_config(Network::Regtest);
+    let mut config: Config = default_config(Network::Mainnet);
+    config.api_key = Some(breez_api_key);
     let seed = Seed::Mnemonic {
         mnemonic: env_var("TEST_MNEMONIC")?,
         passphrase: None,
@@ -868,7 +868,7 @@ async fn init_sdk() -> Result<BreezSdk> {
 async fn get_address(sdk: &BreezSdk) -> Result<String> {
     let info = sdk
         .get_info(GetInfoRequest {
-            ensure_synced: Some(true),
+            ensure_synced: Some(false),
         })
         .await?;
     info!("Balance: {} sats", info.balance_sats);
@@ -886,6 +886,8 @@ async fn send_funds(sdk: &BreezSdk, dest: &str, amount: u64) -> Result<()> {
             payment_request: dest.to_string(),
             amount: Some(amount as u128),
             token_identifier: None,
+            conversion_options: None,
+            fee_policy: None,
         })
         .await?;
     sdk.send_payment(SendPaymentRequest {
@@ -968,7 +970,7 @@ async fn create_order_spark_to_evm(
             owner: dest_owner.to_string(),
             amount: "499".to_string(),
         },
-        solver_id: Some("spark-staging-solver".to_string()),
+        solver_id: Some("staging-2".to_string()),
     };
     let (status, res_text) = make_order_request_with_retry(&client, &url, &req, 5).await?;
     if !status.is_success() {
@@ -1011,7 +1013,7 @@ async fn create_order_evm_to_spark(
             owner: dest_owner.to_string(),
             amount: dest_amount.to_string(),
         },
-        solver_id: Some("spark-staging-solver".to_string()),
+        solver_id: Some("staging-2".to_string()),
     };
     let (status, res_text) = make_order_request_with_retry(&client, &url, &req, 5).await?;
     if !status.is_success() {
