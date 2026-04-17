@@ -1,0 +1,10 @@
+.git
+.gitignore
+target
+tmp
+reports
+.env
+.DS_Store
+**/*.log
+**/*.sqlite
+**/*.sql

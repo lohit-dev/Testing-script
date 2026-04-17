@@ -1,19 +1,27 @@
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.88-slim-bookworm AS builder
 
 WORKDIR /app
 
-# Native build deps commonly needed by crypto/network crates.
+# Lower memory pressure in constrained build environments (e.g. Coolify).
+ENV CARGO_BUILD_JOBS=1
+ENV CARGO_INCREMENTAL=0
+ENV RUSTFLAGS="-C debuginfo=0"
+
+# Native build deps needed for crates in this workspace.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     ca-certificates \
+    binutils \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-# Build both binaries so runtime can choose either.
-RUN cargo build --release --bin testing_script --bin flood_test
+# Build both binaries so runtime can choose either, then strip symbols.
+RUN cargo build --locked --release --bin testing_script --bin flood_test \
+    && strip /app/target/release/testing_script \
+    && strip /app/target/release/flood_test
 
 
 FROM debian:bookworm-slim AS runtime
