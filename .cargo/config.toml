@@ -1,0 +1,5 @@
+# Cargo configuration
+# Note: SSL_CERT_FILE needs to be set as an environment variable
+# Add this to your ~/.zshrc:
+# export SSL_CERT_FILE=/opt/homebrew/etc/ca-certificates/cert.pem
+
