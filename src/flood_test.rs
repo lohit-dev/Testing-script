@@ -21,21 +21,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
-// ============================================================================
-// CONSTANTS
-// ============================================================================
-
-const API_BASE_URL: &str = "https://api.garden-staging.dealpulley.com";
-const GARDEN_APP_ID: &str = "a3a9c5cb79b8dd354c4829ef01342d37e0ca0aa3df3929780b14f6a38e99346b";
-
-const TEST_MNEMONIC: &str =
-    "stomach split fat oil voice swear ecology armor creek author urge pelican";
-const STORAGE_DIR: &str = "./tmp/spark_test_sdk";
-
-const EVM_PRIVATE_KEY: &str = "e7a855ef5d7cbb0704c1e52d59fd2c8e77bfb43c60cba9921f222abf52a5804f";
-const ARBITRUM_SEPOLIA_RPC: &str = "https://sepolia-rollup.arbitrum.io/rpc";
-
-const EVM_DEST_ADDRESS: &str = "0x47b03906469a90c8a597766ab1830c57a656968b";
+fn env_var(key: &str) -> Result<String> {
+    std::env::var(key).map_err(|_| eyre!("Missing required env var: {}", key))
+}
 
 // Flood test config
 const FLOOD_TOTAL_ORDERS: u32 = 50;
@@ -317,6 +305,7 @@ impl FloodReport {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     color_eyre::install()?;
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
@@ -324,7 +313,7 @@ async fn main() -> Result<()> {
 
     info!("╔══════════════════════════════════════════════════════════╗");
     info!("║       GARDEN SWAP FLOOD TEST — STAGING                  ║");
-    info!("║       {}               ║", API_BASE_URL);
+    info!("║       {}               ║", env_var("API_BASE_URL")?);
     info!("╚══════════════════════════════════════════════════════════╝");
 
     // Uncomment the flood test you want:
@@ -369,9 +358,9 @@ async fn flood_spark_to_evm() -> Result<()> {
     let my_address = get_address(&sdk).await?;
     info!("Spark Address: {}", my_address);
 
-    let source_asset = "spark_regtest:btc";
+    let source_asset = "spark:btc";
     let dest_asset = "arbitrum_sepolia:wbtc";
-    let amount_sats: u64 = 500;
+    let amount_sats: u64 = 5;
 
     // ── PHASE 1: Slow Create ────────────────────────────────────
     info!("");
@@ -409,7 +398,7 @@ async fn flood_spark_to_evm() -> Result<()> {
                 source_asset,
                 &my_address,
                 dest_asset,
-                EVM_DEST_ADDRESS,
+                &env_var("EVM_DEST_ADDRESS")?,
                 amount_sats.to_string(),
             )
             .await
@@ -624,8 +613,8 @@ async fn flood_evm_to_spark() -> Result<()> {
     info!("Spark Address: {}", my_spark_address);
 
     // Setup EVM wallet
-    let provider = Provider::<Http>::try_from(ARBITRUM_SEPOLIA_RPC)?;
-    let wallet: LocalWallet = EVM_PRIVATE_KEY
+    let provider = Provider::<Http>::try_from(env_var("ARBITRUM_SEPOLIA_RPC")?)?;
+    let wallet: LocalWallet = env_var("EVM_PRIVATE_KEY")?
         .parse::<LocalWallet>()?
         .with_chain_id(421614u64);
     let evm_address = format!("{:?}", wallet.address());
@@ -633,9 +622,9 @@ async fn flood_evm_to_spark() -> Result<()> {
     let evm_client = Arc::new(SignerMiddleware::new(provider, wallet));
 
     let source_asset = "arbitrum_sepolia:wbtc";
-    let dest_asset = "spark_regtest:btc";
-    let source_amount = "500";
-    let dest_amount = "498";
+    let dest_asset = "spark:btc";
+    let source_amount = "100";
+    let dest_amount = "99";
 
     // ── PHASE 1: Slow Create ────────────────────────────────────
     info!("");
@@ -859,16 +848,17 @@ async fn flood_evm_to_spark() -> Result<()> {
 
 async fn init_sdk() -> Result<BreezSdk> {
     info!("Initializing SDK...");
-    std::fs::create_dir_all(STORAGE_DIR)?;
+    let storage_dir = env_var("STORAGE_DIR")?;
+    std::fs::create_dir_all(&storage_dir)?;
     let config = default_config(Network::Regtest);
     let seed = Seed::Mnemonic {
-        mnemonic: TEST_MNEMONIC.to_string(),
+        mnemonic: env_var("TEST_MNEMONIC")?,
         passphrase: None,
     };
     let sdk = connect(ConnectRequest {
         config,
         seed,
-        storage_dir: STORAGE_DIR.to_string(),
+        storage_dir,
     })
     .await?;
     info!("SDK initialized");
@@ -919,10 +909,11 @@ async fn make_order_request_with_retry(
 ) -> Result<(reqwest::StatusCode, String)> {
     let mut retry_count = 0;
     let base_delay = Duration::from_secs(2);
+    let garden_app_id = env_var("GARDEN_APP_ID")?;
     loop {
         let res = client
             .post(url)
-            .header("garden-app-id", GARDEN_APP_ID)
+            .header("garden-app-id", &garden_app_id)
             .header("Content-Type", "application/json")
             .json(req)
             .send()
@@ -964,7 +955,7 @@ async fn create_order_spark_to_evm(
     dest_owner: &str,
     amount: String,
 ) -> Result<CreateOrderResult> {
-    let url = format!("{}/v2/orders", API_BASE_URL);
+    let url = format!("{}/v2/orders", env_var("API_BASE_URL")?);
     let client = Client::new();
     let req = OrderRequest {
         source: OrderDetails {
@@ -1007,7 +998,7 @@ async fn create_order_evm_to_spark(
     dest_owner: &str,
     dest_amount: &str,
 ) -> Result<EvmToSparkOrderResult> {
-    let url = format!("{}/v2/orders", API_BASE_URL);
+    let url = format!("{}/v2/orders", env_var("API_BASE_URL")?);
     let client = Client::new();
     let req = OrderRequest {
         source: OrderDetails {
@@ -1092,7 +1083,7 @@ async fn execute_evm_transaction(
 // ============================================================================
 
 async fn check_order_status(order_id: &str) -> Result<Option<SwapStatus>> {
-    let url = format!("{}/v2/orders/{}", API_BASE_URL, order_id);
+    let url = format!("{}/v2/orders/{}", env_var("API_BASE_URL")?, order_id);
     let client = Client::new();
     let mut retry_count = 0u32;
     let max_retries = 3u32;
@@ -1101,7 +1092,7 @@ async fn check_order_status(order_id: &str) -> Result<Option<SwapStatus>> {
     loop {
         let response = client
             .get(&url)
-            .header("garden-app-id", GARDEN_APP_ID)
+            .header("garden-app-id", env_var("GARDEN_APP_ID")?)
             .send()
             .await;
 

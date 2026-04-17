@@ -21,34 +21,9 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 mod flood_test;
-// ============================================================================
-// CONSTANTS
-// ============================================================================
-
-// const API_BASE_URL: &str = "https://api.garden-staging.dealpulley.com";
-// const GARDEN_APP_ID: &str = "a3a9c5cb79b8dd354c4829ef01342d37e0ca0aa3df3929780b14f6a38e99346b";
-// const API_BASE_URL: &str = "https://testnet.api.garden.finance"; 
-// const GARDEN_APP_ID: &str = "79702d04cb63391922f2e1471afe4743b0e3ba71f260e3c2117aa36e7fb74a9c";
-
-const QUOTE_BASE_URL: &str = "http://gsg8cwk4k8oscg4sgcgg8ww8.garden-staging.dealpulley.com";
-const  API_BASE_URL: &str = "http://w4skog4oscw8sk00c8g8wg8s.garden-staging.dealpulley.com";
-const GARDEN_APP_ID: &str = "ec2f8d63f5a098aceefff45f0af2afa25f800fdc3af9f094baea084a9860a522";
-
-const TEST_MNEMONIC: &str =
-    "stomach split fat oil voice swear ecology armor creek author urge pelican";
-const STORAGE_DIR: &str = "./tmp/spark_test_sdk";
-
-const EVM_PRIVATE_KEY: &str = "e7a855ef5d7cbb0704c1e52d59fd2c8e77bfb43c60cba9921f222abf52a5804f";
-const ARBITRUM_SEPOLIA_RPC: &str = "https://sepolia-rollup.arbitrum.io/rpc";
-
-const EVM_DEST_ADDRESS: &str = "0x47b03906469a90c8a597766ab1830c57a656968b";
-
-// ============================================================================
-// SOLANA CONSTANTS
-// ============================================================================
-const SOLANA_PRIVATE_KEY: &str =
-    "5QvsL4MZrizGkPbapnz6DQsKGuFUYg2akhuWV6YxsLw7eqHMFKtM55hA8wKMK6VfXkHn6SHsYLpPzNU2UraAdQpj";
-const SOLANA_DEVNET_RPC: &str = "https://api.devnet.solana.com";
+fn env_var(key: &str) -> Result<String> {
+    std::env::var(key).map_err(|_| eyre!("Missing required env var: {}", key))
+}
 
 // ============================================================================
 // SOLANA ORDER RESPONSE TYPES
@@ -69,9 +44,10 @@ mod manual_evm_initiate_tests {
 
     #[tokio::test]
     async fn test_manual_evm_initiate_on_arbitrum() -> Result<()> {
+        dotenvy::dotenv().ok();
         // Init EVM wallet on Arbitrum Sepolia
-        let provider = Provider::<Http>::try_from(ARBITRUM_SEPOLIA_RPC)?;
-        let wallet: LocalWallet = EVM_PRIVATE_KEY
+        let provider = Provider::<Http>::try_from(env_var("ARBITRUM_SEPOLIA_RPC")?)?;
+        let wallet: LocalWallet = env_var("EVM_PRIVATE_KEY")?
             .parse::<LocalWallet>()?
             .with_chain_id(421614u64);
         let client = Arc::new(SignerMiddleware::new(provider, wallet));
@@ -338,6 +314,7 @@ impl BatchTestReport {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     color_eyre::install()?;
     env_logger::builder()
     .filter_level(log::LevelFilter::Off)              // default: nothing logs
@@ -346,13 +323,13 @@ async fn main() -> Result<()> {
 
     info!("╔══════════════════════════════════════════════════════════╗");
     info!("║       GARDEN SWAP TEST SUITE — STAGING                  ║");
-    info!("║       {}               ║", API_BASE_URL);
+    info!("║       {}               ║", env_var("API_BASE_URL")?);
     info!("╚══════════════════════════════════════════════════════════╝");
 
     // ── Uncomment the test you want to run ───────────────────────
 
     // Single order tests (500 sats / 500 wbtc)
-    test_single_evm_to_spark().await?;
+    // test_single_evm_to_spark().await?;
     // for i in 0..100 {
     // test_single_spark_to_evm().await?;
     // }
@@ -361,9 +338,11 @@ async fn main() -> Result<()> {
     // }
     //test_solana_cbbtc_to_spark().await?;
 
-    // Batch stress tests (500 orders)
-    // batch_test_evm_to_spark(100, 5).await?;
-    // batch_test_spark_to_evm(100, 5).await?;
+    // Batch stress tests
+    // Spark -> Arbitrum Sepolia: source 5 sats, destination 4 sats
+    batch_test_spark_to_evm(250, 3).await?;
+    // Arbitrum Sepolia -> Spark: source 100, destination 99
+    batch_test_evm_to_spark(250, 3).await?;
 
     // batch_test_solana_to_spark(500, 10).await?;
     // or
@@ -386,9 +365,10 @@ async fn test_single_spark_to_evm() -> Result<()> {
     info!("My Spark Address: {}", my_address);
 
     // 2. Quote
-    let source_asset = "spark_regtest:btc";
+    let source_asset = "spark:btc";
     let dest_asset = "arbitrum_sepolia:wbtc";
-    let amount_sats: u64 = 500;
+    let amount_sats: u64 = 5;
+    let dest_amount = "4";
 
     info!(
         "Fetching quote {} → {} for {} sats",
@@ -403,8 +383,9 @@ async fn test_single_spark_to_evm() -> Result<()> {
         source_asset,
         &my_address,
         dest_asset,
-        EVM_DEST_ADDRESS,
+        &env_var("EVM_DEST_ADDRESS")?,
         amount_sats.to_string(),
+        dest_amount.to_string(),
     )
     .await?;
     info!(
@@ -439,8 +420,8 @@ async fn test_single_evm_to_spark() -> Result<()> {
     info!("My Spark Address: {}", my_spark_address);
 
     // 2. Setup EVM wallet
-    let provider = Provider::<Http>::try_from(ARBITRUM_SEPOLIA_RPC)?;
-    let wallet: LocalWallet = EVM_PRIVATE_KEY
+    let provider = Provider::<Http>::try_from(env_var("ARBITRUM_SEPOLIA_RPC")?)?;
+    let wallet: LocalWallet = env_var("EVM_PRIVATE_KEY")?
         .parse::<LocalWallet>()?
         .with_chain_id(421614u64);
     let evm_address = format!("{:?}", wallet.address());
@@ -449,12 +430,12 @@ async fn test_single_evm_to_spark() -> Result<()> {
 
     // 3. Quote
     let source_asset = "arbitrum_sepolia:wbtc";
-    let dest_asset = "spark_regtest:btc";
-    let source_amount = "500";
-    let dest_amount = "498";
+    let dest_asset = "spark:btc";
+    let source_amount = "100";
+    let dest_amount = "99";
 
     info!("Fetching quote {} → {}", source_asset, dest_asset);
-    let quote = get_quote(dest_asset, source_asset, 500).await?;
+    let quote = get_quote(source_asset, dest_asset, 100).await?;
     info!("Quote: {:?}", quote);
 
     // 4. Create Order
@@ -512,9 +493,10 @@ async fn batch_test_spark_to_evm(total_orders: u32, batch_size: u32) -> Result<B
     let my_address = get_address(&sdk).await?;
     info!("My Spark Address: {}", my_address);
 
-    let source_asset = "spark_regtest:btc";
+    let source_asset = "spark:btc";
     let dest_asset = "arbitrum_sepolia:wbtc";
-    let amount_sats: u64 = 500;
+    let amount_sats: u64 = 5;
+    let dest_amount_sats: u64 = 4;
 
     let num_batches = (total_orders + batch_size - 1) / batch_size;
 
@@ -546,8 +528,9 @@ async fn batch_test_spark_to_evm(total_orders: u32, batch_size: u32) -> Result<B
                 source_asset,
                 &my_address,
                 dest_asset,
-                EVM_DEST_ADDRESS,
+                &env_var("EVM_DEST_ADDRESS")?,
                 amount_sats.to_string(),
+                dest_amount_sats.to_string(),
             )
             .await
             {
@@ -644,8 +627,8 @@ async fn batch_test_evm_to_spark(total_orders: u32, batch_size: u32) -> Result<B
     let my_spark_address = get_address(&sdk).await?;
     info!("My Spark Address: {}", my_spark_address);
 
-    let provider = Provider::<Http>::try_from(ARBITRUM_SEPOLIA_RPC)?;
-    let wallet: LocalWallet = EVM_PRIVATE_KEY
+    let provider = Provider::<Http>::try_from(env_var("ARBITRUM_SEPOLIA_RPC")?)?;
+    let wallet: LocalWallet = env_var("EVM_PRIVATE_KEY")?
         .parse::<LocalWallet>()?
         .with_chain_id(421614u64);
     let evm_address = format!("{:?}", wallet.address());
@@ -653,9 +636,9 @@ async fn batch_test_evm_to_spark(total_orders: u32, batch_size: u32) -> Result<B
     let client = Arc::new(SignerMiddleware::new(provider, wallet));
 
     let source_asset = "arbitrum_sepolia:wbtc";
-    let dest_asset = "spark_regtest:btc";
-    let source_amount = "500";
-    let dest_amount = "490";
+    let dest_asset = "spark:btc";
+    let source_amount = "100";
+    let dest_amount = "99";
 
     let num_batches = (total_orders + batch_size - 1) / batch_size;
 
@@ -776,16 +759,17 @@ async fn batch_test_evm_to_spark(total_orders: u32, batch_size: u32) -> Result<B
 
 async fn init_sdk() -> Result<BreezSdk> {
     info!("Initializing SDK...");
-    std::fs::create_dir_all(STORAGE_DIR)?;
+    let storage_dir = env_var("STORAGE_DIR")?;
+    std::fs::create_dir_all(&storage_dir)?;
     let config = default_config(Network::Regtest);
     let seed = Seed::Mnemonic {
-        mnemonic: TEST_MNEMONIC.to_string(),
+        mnemonic: env_var("TEST_MNEMONIC")?,
         passphrase: None,
     };
     let connect_request = ConnectRequest {
         config,
         seed,
-        storage_dir: STORAGE_DIR.to_string(),
+        storage_dir,
     };
     let sdk = connect(connect_request).await?;
     info!("SDK initialized successfully");
@@ -833,11 +817,12 @@ async fn send_funds(sdk: &BreezSdk, dest: &str, amount: u64) -> Result<()> {
 
 #[allow(dead_code)]
 async fn get_quote(from: &str, to: &str, amount: u64) -> Result<Value> {
-    let url = format!("{}/v2/quote", QUOTE_BASE_URL);
+    let url = format!("{}/v2/quote", env_var("QUOTE_BASE_URL")?);
     let client = Client::new();
+    let garden_app_id = env_var("GARDEN_APP_ID")?;
     let response = client
         .get(&url)
-        .header("garden-app-id", GARDEN_APP_ID)
+        .header("garden-app-id", garden_app_id)
         .query(&[
             ("from", from),
             ("to", to),
@@ -870,10 +855,11 @@ async fn make_order_request_with_retry(
 ) -> Result<(reqwest::StatusCode, String)> {
     let mut retry_count = 0;
     let base_delay = Duration::from_secs(1);
+    let garden_app_id = env_var("GARDEN_APP_ID")?;
     loop {
         let res = client
             .post(url)
-            .header("garden-app-id", GARDEN_APP_ID)
+            .header("garden-app-id", &garden_app_id)
             .header("Content-Type", "application/json")
             .json(req)
             .send()
@@ -913,8 +899,9 @@ async fn create_order_spark_to_evm(
     dest_asset: &str,
     dest_owner: &str,
     amount: String,
+    dest_amount: String,
 ) -> Result<CreateOrderResult> {
-    let url = format!("{}/v2/orders", API_BASE_URL);
+    let url = format!("{}/v2/orders", env_var("API_BASE_URL")?);
     let client = Client::new();
     let req = OrderRequest {
         source: OrderDetails {
@@ -925,7 +912,7 @@ async fn create_order_spark_to_evm(
         destination: OrderDetails {
             asset: dest_asset.to_string(),
             owner: dest_owner.to_string(),
-            amount: "499".to_string(),
+            amount: dest_amount,
         },
         solver_id: None,
     };
@@ -958,7 +945,7 @@ async fn create_order_evm_to_spark(
     dest_owner: &str,
     dest_amount: &str,
 ) -> Result<EvmToSparkOrderResult> {
-    let url = format!("{}/v2/orders", API_BASE_URL);
+    let url = format!("{}/v2/orders", env_var("API_BASE_URL")?);
     let client = Client::new();
     let req = OrderRequest {
         source: OrderDetails {
@@ -1069,7 +1056,7 @@ async fn execute_evm_transaction(
             tx_data.to, value, data_len
         );
         error!("Tx hash: {:?}", tx_hash);
-        error!("Debug: GET {}/v2/orders/<order_id>", API_BASE_URL);
+        error!("Debug: GET {}/v2/orders/<order_id>", env_var("API_BASE_URL")?);
         error!("Explorer: https://sepolia.arbiscan.io/tx/{:?}", tx_hash);
         return Err(eyre!("Transaction reverted: {}", error_msg));
     }
@@ -1085,7 +1072,8 @@ async fn check_order_status_with_retry(
     order_id: &str,
     max_retries: u32,
 ) -> Result<Option<SwapStatus>> {
-    let url = format!("{}/v2/orders/{}", API_BASE_URL, order_id);
+    let api_base_url = env_var("API_BASE_URL")?;
+    let url = format!("{}/v2/orders/{}", api_base_url, order_id);
     let client = Client::new();
     let mut retry_count = 0;
     let base_delay = Duration::from_secs(1);
@@ -1093,7 +1081,7 @@ async fn check_order_status_with_retry(
     loop {
         let response = client
             .get(&url)
-            .header("garden-app-id", GARDEN_APP_ID)
+            .header("garden-app-id", env_var("GARDEN_APP_ID")?)
             .send()
             .await;
 
@@ -1400,7 +1388,7 @@ async fn test_solona_to_spark() -> Result<()> {
     info!("Spark Destination Address: {}", spark_address);
 
     // 2. Setup Solana keypair from base58 private key
-    let keypair_bytes = bs58::decode(SOLANA_PRIVATE_KEY)
+    let keypair_bytes = bs58::decode(env_var("SOLANA_PRIVATE_KEY")?)
         .into_vec()
         .map_err(|e| eyre!("Failed to decode Solana private key: {}", e))?;
     let keypair =
@@ -1410,7 +1398,7 @@ async fn test_solona_to_spark() -> Result<()> {
 
     // 3. Setup async Solana RPC client
     let rpc_client = SolanaRpcClient::new_with_commitment(
-        SOLANA_DEVNET_RPC.to_string(),
+        env_var("SOLANA_DEVNET_RPC")?,
         CommitmentConfig::confirmed(),
     );
 
@@ -1434,7 +1422,7 @@ async fn test_solona_to_spark() -> Result<()> {
 
     // 4. Get Quote: 0.001 SOL = 1,000,000 lamports
     let source_asset = "solana_testnet:sol";
-    let dest_asset = "spark_regtest:btc";
+    let dest_asset = "spark:btc";
     let amount_lamports: u64 = 1_000_000;
 
     info!(
@@ -1511,7 +1499,7 @@ async fn create_order_solana_to_spark(
     dest_owner: &str,
     dest_amount: &str,
 ) -> Result<SolanaOrderResult> {
-    let url = format!("{}/v2/orders", API_BASE_URL);
+    let url = format!("{}/v2/orders", env_var("API_BASE_URL")?);
     let client = Client::new();
     let req = OrderRequest {
         source: OrderDetails {
@@ -1574,7 +1562,7 @@ async fn test_solana_cbbtc_to_spark() -> Result<()> {
     info!("Spark Destination Address: {}", spark_address);
 
     // 2. Setup Solana keypair from base58 private key
-    let keypair_bytes = bs58::decode(SOLANA_PRIVATE_KEY)
+    let keypair_bytes = bs58::decode(env_var("SOLANA_PRIVATE_KEY")?)
         .into_vec()
         .map_err(|e| eyre!("Failed to decode Solana private key: {}", e))?;
     let keypair =
@@ -1584,7 +1572,7 @@ async fn test_solana_cbbtc_to_spark() -> Result<()> {
 
     // 3. Setup Solana RPC client (testnet)
     let rpc_client = SolanaRpcClient::new_with_commitment(
-        SOLANA_DEVNET_RPC.to_string(), // "https://api.devnet.solana.com"
+        env_var("SOLANA_DEVNET_RPC")?,
         CommitmentConfig::confirmed(),
     );
 
@@ -1608,7 +1596,7 @@ async fn test_solana_cbbtc_to_spark() -> Result<()> {
 
     // 4. Get Quote: 0.0005 cbBTC = 50,000 units (8 decimals)
     let source_asset = "solana_testnet:cbbtc";
-    let dest_asset = "spark_regtest:btc";
+    let dest_asset = "spark:btc";
     let amount: u64 = 50_000; // 0.0005 cbBTC
 
     info!(
@@ -1703,7 +1691,7 @@ async fn batch_test_spark_to_solana(total_orders: u32, batch_size: u32) -> Resul
 
     // 2. Solana destination wallet (reuse SOLANA_PRIVATE_KEY as recipient identity,
     //    or substitute a dedicated destination pubkey string if preferred)
-    let keypair_bytes = bs58::decode(SOLANA_PRIVATE_KEY)
+    let keypair_bytes = bs58::decode(env_var("SOLANA_PRIVATE_KEY")?)
         .into_vec()
         .map_err(|e| eyre!("Failed to decode Solana private key: {}", e))?;
     let keypair =
@@ -1711,7 +1699,7 @@ async fn batch_test_spark_to_solana(total_orders: u32, batch_size: u32) -> Resul
     let solana_dest_address = keypair.pubkey().to_string();
     info!("Solana Destination Address: {}", solana_dest_address);
 
-    let source_asset = "spark_regtest:btc";
+    let source_asset = "spark:btc";
     let dest_asset = "solana_testnet:sol";
     let amount_sats: u64 = 10_000; // sats sent from Spark side
 
@@ -1765,10 +1753,8 @@ async fn batch_test_spark_to_solana(total_orders: u32, batch_size: u32) -> Resul
                 dest_asset,
                 &solana_dest_address,
                 amount_sats.to_string(),
+                dest_amount,
             )
-            // NOTE: create_order_spark_to_evm hardcodes dest amount to "499".
-            // For Solana you need a proper dest_amount, so call the generic helper below:
-            // create_order_spark_to_solana(...).await
             .await
             {
                 Ok(order_res) => {
@@ -1857,7 +1843,7 @@ async fn create_order_spark_to_solana(
     dest_owner: &str,
     dest_amount: String,
 ) -> Result<CreateOrderResult> {
-    let url = format!("{}/v2/orders", API_BASE_URL);
+    let url = format!("{}/v2/orders", env_var("API_BASE_URL")?);
     let client = Client::new();
     let req = OrderRequest {
         source: OrderDetails {
@@ -1921,7 +1907,7 @@ async fn batch_test_solana_to_spark(total_orders: u32, batch_size: u32) -> Resul
     info!("Spark Destination Address: {}", spark_address);
 
     // 2. Setup Solana keypair
-    let keypair_bytes = bs58::decode(SOLANA_PRIVATE_KEY)
+    let keypair_bytes = bs58::decode(env_var("SOLANA_PRIVATE_KEY")?)
         .into_vec()
         .map_err(|e| eyre!("Failed to decode Solana private key: {}", e))?;
     let keypair =
@@ -1931,7 +1917,7 @@ async fn batch_test_solana_to_spark(total_orders: u32, batch_size: u32) -> Resul
 
     // 3. Solana RPC client
     let rpc_client = SolanaRpcClient::new_with_commitment(
-        SOLANA_DEVNET_RPC.to_string(),
+        env_var("SOLANA_DEVNET_RPC")?,
         CommitmentConfig::confirmed(),
     );
 
@@ -1961,7 +1947,7 @@ async fn batch_test_solana_to_spark(total_orders: u32, batch_size: u32) -> Resul
     }
 
     let source_asset = "solana_testnet:sol";
-    let dest_asset = "spark_regtest:btc";
+    let dest_asset = "spark:btc";
 
     let num_batches = (total_orders + batch_size - 1) / batch_size;
 
