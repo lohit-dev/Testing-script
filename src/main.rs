@@ -65,6 +65,27 @@ mod manual_evm_initiate_tests {
     }
 }
 
+#[cfg(test)]
+mod spark_address_verification_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "Requires network + valid Breez credentials"]
+    async fn verify_expected_spark_address_from_mnemonic() -> Result<()> {
+        dotenvy::dotenv().ok();
+        let expected = "spark1pgssxklgsn4sytzymxah4jf3r8rzqgsxmsv63nrs4jj0w0ed634kjq32p6hxju";
+
+        let sdk = init_sdk().await?;
+        let actual = get_address(&sdk).await?;
+        assert_eq!(
+            actual, expected,
+            "Spark address mismatch. expected={}, actual={}",
+            expected, actual
+        );
+        Ok(())
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 struct SolanaOrderResult {
