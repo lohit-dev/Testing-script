@@ -8,10 +8,10 @@ MAX_REPORT_FILES="${MAX_REPORT_FILES:-200}"
 
 case "$RUN_MODE" in
   testing_script)
-    CMD="/usr/local/bin/testing_script"
+    CMD="${TESTING_SCRIPT_CMD:-/usr/local/bin/testing_script}"
     ;;
   flood_test)
-    CMD="/usr/local/bin/flood_test"
+    CMD="${FLOOD_TEST_CMD:-/usr/local/bin/flood_test}"
     ;;
   *)
     echo "Invalid RUN_MODE: $RUN_MODE (use testing_script or flood_test)"
