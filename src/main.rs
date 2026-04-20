@@ -14,22 +14,15 @@ use log::{error, info};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::task::JoinSet;
 use tokio::time::sleep;
 
-mod flood_test;
 fn env_var(key: &str) -> Result<String> {
     std::env::var(key).map_err(|_| eyre!("Missing required env var: {}", key))
-}
-
-// ============================================================================
-// SOLANA ORDER RESPONSE TYPES
-// ============================================================================
-#[derive(Deserialize, Debug, Clone)]
-struct SolanaOrderResponse {
-    status: String,
-    result: SolanaOrderResult,
 }
 
 // ============================================================================
@@ -84,14 +77,6 @@ mod spark_address_verification_tests {
         );
         Ok(())
     }
-}
-
-#[allow(dead_code)]
-#[derive(Deserialize, Debug, Clone)]
-struct SolanaOrderResult {
-    order_id: String,
-    versioned_tx: String,
-    versioned_tx_gasless: Option<String>,
 }
 
 // ============================================================================
@@ -196,6 +181,20 @@ struct SwapStatus {
     dest_init: String,
     source_redeem: String,
     dest_redeem: String,
+}
+
+#[derive(Debug, Clone)]
+struct OrderTimelineReport {
+    order_id: String,
+    create_attempt_at_secs: f64,
+    create_success: bool,
+    source_init_after_secs: Option<f64>,
+    destination_init_after_secs: Option<f64>,
+    destination_redeem_after_secs: Option<f64>,
+    source_redeem_after_secs: Option<f64>,
+    final_status: String,
+    note: String,
+    error: String,
 }
 
 // ============================================================================
@@ -345,30 +344,711 @@ async fn main() -> Result<()> {
     info!("║       {}               ║", env_var("API_BASE_URL")?);
     info!("╚══════════════════════════════════════════════════════════╝");
 
-    // ── Uncomment the test you want to run ───────────────────────
-
-    // Single order tests (Spark->EVM: 5->4 sats, EVM->Spark: 100->99 units)
-    // test_single_evm_to_spark().await?;
-    // test_single_spark_to_evm().await?;
-    // for i in 0..100 {
-    // test_single_spark_to_evm().await?;
-    // }
-    // for i in 0..100 {
-    //     test_solona_to_spark().await?;
-    // }
-    //test_solana_cbbtc_to_spark().await?;
-
-    // Batch stress tests
-    // Spark -> Arbitrum Sepolia: source 5 sats, destination 4 sats
-    batch_test_spark_to_evm(100, 3).await?;
-    // Arbitrum Sepolia -> Spark: source 100, destination 99
-    batch_test_evm_to_spark(100, 3).await?;
-
-    // batch_test_solana_to_spark(500, 10).await?;
-    // or
-    // batch_test_spark_to_solana(500, 10).await?;
+    // Select scenario via env var TEST_MODE to avoid accidental runs.
+    // Supported values:
+    // - baseline
+    // - single_spark_to_evm
+    // - single_evm_to_spark
+    // - batch_spark_to_evm
+    // - batch_evm_to_spark
+    let test_mode = std::env::var("TEST_MODE").unwrap_or_else(|_| "baseline".to_string());
+    match test_mode.as_str() {
+        "baseline" => run_spark_to_evm_minute_baseline_for_a_day().await?,
+        "single_spark_to_evm" => test_single_spark_to_evm().await?,
+        "single_evm_to_spark" => test_single_evm_to_spark().await?,
+        "batch_spark_to_evm" => {
+            let _ = batch_test_spark_to_evm(100, 3).await?;
+        }
+        "batch_evm_to_spark" => {
+            let _ = batch_test_evm_to_spark(100, 3).await?;
+        }
+        other => {
+            return Err(eyre!(
+                "Unknown TEST_MODE='{}'. Use one of: baseline, single_spark_to_evm, single_evm_to_spark, batch_spark_to_evm, batch_evm_to_spark",
+                other
+            ));
+        }
+    }
 
     Ok(())
+}
+
+// ============================================================================
+// BASELINE SOAK TEST: CREATE 2 ORDERS / MIN FOR 24H + PER-ORDER TIMELINE REPORT
+// ============================================================================
+
+async fn run_spark_to_evm_minute_baseline_for_a_day() -> Result<()> {
+    const CREATION_INTERVAL: Duration = Duration::from_secs(60);
+    const RUN_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+    const ORDER_POLL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+    const POLL_EVERY: Duration = Duration::from_secs(5);
+
+    info!("=== Baseline Soak: 1 Spark->EVM + 1 EVM->Spark per minute for 24h ===");
+    info!(
+        "Per-order timeout: {:.0} min | Poll interval: {}s",
+        ORDER_POLL_TIMEOUT.as_secs_f64() / 60.0,
+        POLL_EVERY.as_secs()
+    );
+
+    let sdk = init_sdk().await?;
+    let my_address = get_address(&sdk).await?;
+    let source_asset = "spark:btc";
+    let dest_asset = "arbitrum_sepolia:wbtc";
+    let source_amount_sats: u64 = 5;
+    let destination_amount = "4".to_string();
+    let evm_dest_address = env_var("EVM_DEST_ADDRESS")?;
+
+    let provider = Provider::<Http>::try_from(env_var("ARBITRUM_SEPOLIA_RPC")?)?;
+    let wallet: LocalWallet = env_var("EVM_PRIVATE_KEY")?
+        .parse::<LocalWallet>()?
+        .with_chain_id(421614u64);
+    let evm_source_address = format!("{:?}", wallet.address());
+    let evm_client = Arc::new(SignerMiddleware::new(provider, wallet));
+
+    let evm_to_spark_source_asset = "arbitrum_sepolia:wbtc";
+    let evm_to_spark_dest_asset = "spark:btc";
+    let evm_to_spark_source_amount = "10";
+    let evm_to_spark_dest_amount = "9";
+
+    let (live_csv_path, mut live_csv_file) = init_live_report_csv()?;
+    let run_start = Instant::now();
+    let mut minute_idx: u64 = 0;
+    let mut monitor_set: JoinSet<OrderTimelineReport> = JoinSet::new();
+    let mut report_rows: Vec<OrderTimelineReport> = Vec::new();
+
+    while run_start.elapsed() < RUN_DURATION {
+        minute_idx += 1;
+        let minute_start = Instant::now();
+        info!("");
+        info!(
+            "----- Minute {} (elapsed {:.1} min) -----",
+            minute_idx,
+            run_start.elapsed().as_secs_f64() / 60.0
+        );
+
+        let spark_result = create_spark_to_evm_minute_order(
+            minute_idx,
+            run_start.elapsed().as_secs_f64(),
+            source_asset,
+            &my_address,
+            dest_asset,
+            &evm_dest_address,
+            source_amount_sats,
+            &destination_amount,
+            &sdk,
+        )
+        .await;
+
+        // Avoid burst traffic across providers/services.
+        sleep(Duration::from_secs(3)).await;
+
+        let evm_result = create_evm_to_spark_minute_order(
+            minute_idx,
+            run_start.elapsed().as_secs_f64(),
+            evm_to_spark_source_asset,
+            &evm_source_address,
+            evm_to_spark_source_amount,
+            evm_to_spark_dest_asset,
+            &my_address,
+            evm_to_spark_dest_amount,
+            &evm_client,
+        )
+        .await;
+
+        handle_minute_order_result(
+            spark_result,
+            &mut report_rows,
+            &mut live_csv_file,
+            &mut monitor_set,
+            ORDER_POLL_TIMEOUT,
+            POLL_EVERY,
+            &live_csv_path,
+        )?;
+        handle_minute_order_result(
+            evm_result,
+            &mut report_rows,
+            &mut live_csv_file,
+            &mut monitor_set,
+            ORDER_POLL_TIMEOUT,
+            POLL_EVERY,
+            &live_csv_path,
+        )?;
+        drain_ready_monitor_rows(
+            &mut monitor_set,
+            &mut report_rows,
+            &mut live_csv_file,
+            &live_csv_path,
+        )?;
+
+        // Baseline requirement: always attempt 2 new orders every minute.
+        let elapsed_this_minute = minute_start.elapsed();
+        if elapsed_this_minute < CREATION_INTERVAL {
+            sleep(CREATION_INTERVAL - elapsed_this_minute).await;
+        } else {
+            info!(
+                "Minute {} creation work took {:.1}s (> 60s), continuing immediately",
+                minute_idx,
+                elapsed_this_minute.as_secs_f64()
+            );
+        }
+    }
+
+    info!("");
+    info!(
+        "24h creation window finished. Waiting for {} order pollers...",
+        monitor_set.len()
+    );
+
+    while let Some(result) = monitor_set.join_next().await {
+        match result {
+            Ok(row) => {
+                append_and_persist_row(&mut report_rows, &mut live_csv_file, row)?;
+            }
+            Err(e) => append_and_persist_row(
+                &mut report_rows,
+                &mut live_csv_file,
+                build_pending_row(
+                    "poll_task_join_error".to_string(),
+                    run_start.elapsed().as_secs_f64(),
+                    true,
+                    format!("poll task failed to join: {}", e),
+                    format!("{:#}", e),
+                ),
+            )?,
+        }
+    }
+
+    print_timeline_report(&report_rows, run_start.elapsed().as_secs_f64());
+    info!("Live CSV report: {}", live_csv_path);
+    write_timeline_report_txt(&report_rows)?;
+    info!("=== Baseline Soak Complete ===");
+    Ok(())
+}
+
+fn build_pending_row(
+    order_id: String,
+    create_attempt_at_secs: f64,
+    create_success: bool,
+    note: String,
+    error: String,
+) -> OrderTimelineReport {
+    OrderTimelineReport {
+        order_id,
+        create_attempt_at_secs,
+        create_success,
+        source_init_after_secs: None,
+        destination_init_after_secs: None,
+        destination_redeem_after_secs: None,
+        source_redeem_after_secs: None,
+        final_status: "pending".to_string(),
+        note,
+        error,
+    }
+}
+
+fn spawn_order_monitor(
+    set: &mut JoinSet<OrderTimelineReport>,
+    order_id: String,
+    create_attempt_at_secs: f64,
+    order_poll_timeout: Duration,
+    poll_every: Duration,
+    live_csv_path: String,
+) {
+    set.spawn(async move {
+        monitor_order_timeline(
+            order_id,
+            create_attempt_at_secs,
+            Instant::now(),
+            order_poll_timeout,
+            poll_every,
+            Some(live_csv_path),
+        )
+        .await
+    });
+}
+
+enum MinuteOrderResult {
+    Pending(OrderTimelineReport),
+    Monitoring {
+        order_id: String,
+        create_attempt_at_secs: f64,
+    },
+}
+
+async fn create_spark_to_evm_minute_order(
+    minute_idx: u64,
+    create_attempt_at_secs: f64,
+    source_asset: &str,
+    source_owner: &str,
+    dest_asset: &str,
+    dest_owner: &str,
+    source_amount_sats: u64,
+    destination_amount: &str,
+    sdk: &BreezSdk,
+) -> MinuteOrderResult {
+    info!("[m{} spark->evm] Creating order...", minute_idx);
+    match create_order_spark_to_evm(
+        source_asset,
+        source_owner,
+        dest_asset,
+        dest_owner,
+        source_amount_sats.to_string(),
+        destination_amount.to_string(),
+    )
+    .await
+    {
+        Ok(order) => {
+            let order_id = order.order_id.clone();
+            info!("[m{} spark->evm] Created order_id={}", minute_idx, order_id);
+            match order.amount.parse::<u64>() {
+                Ok(amount_to_send) => {
+                    if let Err(e) = send_funds(sdk, &order.to, amount_to_send).await {
+                        MinuteOrderResult::Pending(build_pending_row(
+                            order_id,
+                            create_attempt_at_secs,
+                            true,
+                            format!("funding failed: {}", e),
+                            format!("{:#}", e),
+                        ))
+                    } else {
+                        MinuteOrderResult::Monitoring {
+                            order_id: order.order_id,
+                            create_attempt_at_secs,
+                        }
+                    }
+                }
+                Err(e) => MinuteOrderResult::Pending(build_pending_row(
+                    order_id,
+                    create_attempt_at_secs,
+                    true,
+                    format!("failed to parse amount for send: {}", e),
+                    format!("{:#}", e),
+                )),
+            }
+        }
+        Err(e) => MinuteOrderResult::Pending(build_pending_row(
+            format!("create_failed_m{}_spark_to_evm", minute_idx),
+            create_attempt_at_secs,
+            false,
+            "spark->evm order create failed".to_string(),
+            format!("{:#}", e),
+        )),
+    }
+}
+
+async fn create_evm_to_spark_minute_order(
+    minute_idx: u64,
+    create_attempt_at_secs: f64,
+    source_asset: &str,
+    source_owner: &str,
+    source_amount: &str,
+    dest_asset: &str,
+    dest_owner: &str,
+    dest_amount: &str,
+    evm_client: &Arc<SignerMiddleware<Provider<Http>, LocalWallet>>,
+) -> MinuteOrderResult {
+    info!("[m{} evm->spark] Creating order...", minute_idx);
+    match create_order_evm_to_spark(
+        source_asset,
+        source_owner,
+        source_amount,
+        dest_asset,
+        dest_owner,
+        dest_amount,
+    )
+    .await
+    {
+        Ok(order) => {
+            let order_id = order.order_id.clone();
+            info!("[m{} evm->spark] Created order_id={}", minute_idx, order_id);
+
+            if let Some(approval_tx) = &order.approval_transaction {
+                if let Err(e) = execute_evm_transaction(evm_client, approval_tx).await {
+                    return MinuteOrderResult::Pending(build_pending_row(
+                        order_id,
+                        create_attempt_at_secs,
+                        true,
+                        "evm->spark approval tx failed".to_string(),
+                        format!("{:#}", e),
+                    ));
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
+
+            if let Err(e) = execute_evm_transaction(evm_client, &order.initiate_transaction).await {
+                MinuteOrderResult::Pending(build_pending_row(
+                    order_id,
+                    create_attempt_at_secs,
+                    true,
+                    "evm->spark initiate tx failed".to_string(),
+                    format!("{:#}", e),
+                ))
+            } else {
+                MinuteOrderResult::Monitoring {
+                    order_id: order.order_id,
+                    create_attempt_at_secs,
+                }
+            }
+        }
+        Err(e) => MinuteOrderResult::Pending(build_pending_row(
+            format!("create_failed_m{}_evm_to_spark", minute_idx),
+            create_attempt_at_secs,
+            false,
+            "evm->spark order create failed".to_string(),
+            format!("{:#}", e),
+        )),
+    }
+}
+
+fn handle_minute_order_result(
+    result: MinuteOrderResult,
+    rows: &mut Vec<OrderTimelineReport>,
+    live_csv_file: &mut File,
+    monitor_set: &mut JoinSet<OrderTimelineReport>,
+    order_poll_timeout: Duration,
+    poll_every: Duration,
+    live_csv_path: &str,
+) -> Result<()> {
+    match result {
+        MinuteOrderResult::Pending(row) => append_and_persist_row(rows, live_csv_file, row),
+        MinuteOrderResult::Monitoring {
+            order_id,
+            create_attempt_at_secs,
+        } => {
+            spawn_order_monitor(
+                monitor_set,
+                order_id,
+                create_attempt_at_secs,
+                order_poll_timeout,
+                poll_every,
+                live_csv_path.to_string(),
+            );
+            Ok(())
+        }
+    }
+}
+
+fn init_live_report_csv() -> Result<(String, File)> {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let path = format!("order_timeline_report_{}.csv", ts);
+    let mut file = File::create(&path)?;
+    writeln!(
+        file,
+        "order_id,create_attempt_at_secs,create_success,source_init_after_secs,destination_init_after_secs,destination_redeem_after_secs,source_redeem_after_secs,status,note,error"
+    )?;
+    file.flush()?;
+    Ok((path, file))
+}
+
+fn append_row_to_csv(file: &mut File, row: &OrderTimelineReport) -> Result<()> {
+    writeln!(
+        file,
+        "{},{:.2},{},{},{},{},{},{},{},{}",
+        row.order_id,
+        row.create_attempt_at_secs,
+        row.create_success,
+        row.source_init_after_secs
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_default(),
+        row.destination_init_after_secs
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_default(),
+        row.destination_redeem_after_secs
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_default(),
+        row.source_redeem_after_secs
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_default(),
+        row.final_status,
+        sanitize_cell(&row.note),
+        sanitize_cell(&row.error)
+    )?;
+    file.flush()?;
+    Ok(())
+}
+
+fn append_snapshot_row_to_csv_path(path: &str, row: &OrderTimelineReport) -> Result<()> {
+    let mut file = OpenOptions::new().append(true).open(path)?;
+    append_row_to_csv(&mut file, row)
+}
+
+fn append_and_persist_row(
+    rows: &mut Vec<OrderTimelineReport>,
+    file: &mut File,
+    row: OrderTimelineReport,
+) -> Result<()> {
+    append_row_to_csv(file, &row)?;
+    rows.push(row);
+    Ok(())
+}
+
+fn drain_ready_monitor_rows(
+    monitor_set: &mut JoinSet<OrderTimelineReport>,
+    rows: &mut Vec<OrderTimelineReport>,
+    live_csv_file: &mut File,
+    live_csv_path: &str,
+) -> Result<()> {
+    while let Some(result) = monitor_set.try_join_next() {
+        match result {
+            Ok(row) => append_and_persist_row(rows, live_csv_file, row)?,
+            Err(e) => append_and_persist_row(
+                rows,
+                live_csv_file,
+                build_pending_row(
+                    "poll_task_join_error".to_string(),
+                    0.0,
+                    true,
+                    format!("poll task failed to join: {}", e),
+                    format!("{:#}", e),
+                ),
+            )?,
+        }
+    }
+    let _ = live_csv_path;
+    Ok(())
+}
+
+async fn monitor_order_timeline(
+    order_id: String,
+    create_attempt_at_secs: f64,
+    start_time: Instant,
+    timeout: Duration,
+    poll_every: Duration,
+    live_csv_path: Option<String>,
+) -> OrderTimelineReport {
+    let mut source_init_after_secs: Option<f64> = None;
+    let mut destination_init_after_secs: Option<f64> = None;
+    let mut destination_redeem_after_secs: Option<f64> = None;
+    let mut source_redeem_after_secs: Option<f64> = None;
+    let mut note = "ok".to_string();
+    let mut captured_error = String::new();
+    let mut consecutive_errors = 0_u32;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+
+    if let Some(path) = &live_csv_path {
+        let _ = append_snapshot_row_to_csv_path(
+            path,
+            &OrderTimelineReport {
+                order_id: order_id.clone(),
+                create_attempt_at_secs,
+                create_success: true,
+                source_init_after_secs: None,
+                destination_init_after_secs: None,
+                destination_redeem_after_secs: None,
+                source_redeem_after_secs: None,
+                final_status: "pending".to_string(),
+                note: "monitoring".to_string(),
+                error: String::new(),
+            },
+        );
+    }
+
+    loop {
+        if start_time.elapsed() > timeout {
+            note = "poll timeout after 1 hour".to_string();
+            break;
+        }
+
+        match check_order_status(&order_id).await {
+            Ok(Some(s)) => {
+                consecutive_errors = 0;
+                let elapsed = start_time.elapsed().as_secs_f64();
+
+                if source_init_after_secs.is_none() && !s.source_init.is_empty() {
+                    source_init_after_secs = Some(elapsed);
+                    if let Some(path) = &live_csv_path {
+                        let _ = append_snapshot_row_to_csv_path(
+                            path,
+                            &OrderTimelineReport {
+                                order_id: order_id.clone(),
+                                create_attempt_at_secs,
+                                create_success: true,
+                                source_init_after_secs,
+                                destination_init_after_secs,
+                                destination_redeem_after_secs,
+                                source_redeem_after_secs,
+                                final_status: "pending".to_string(),
+                                note: "source init detected".to_string(),
+                                error: String::new(),
+                            },
+                        );
+                    }
+                }
+                if destination_init_after_secs.is_none() && !s.dest_init.is_empty() {
+                    destination_init_after_secs = Some(elapsed);
+                    if let Some(path) = &live_csv_path {
+                        let _ = append_snapshot_row_to_csv_path(
+                            path,
+                            &OrderTimelineReport {
+                                order_id: order_id.clone(),
+                                create_attempt_at_secs,
+                                create_success: true,
+                                source_init_after_secs,
+                                destination_init_after_secs,
+                                destination_redeem_after_secs,
+                                source_redeem_after_secs,
+                                final_status: "pending".to_string(),
+                                note: "destination init detected".to_string(),
+                                error: String::new(),
+                            },
+                        );
+                    }
+                }
+                if destination_redeem_after_secs.is_none() && !s.dest_redeem.is_empty() {
+                    destination_redeem_after_secs = Some(elapsed);
+                    if let Some(path) = &live_csv_path {
+                        let _ = append_snapshot_row_to_csv_path(
+                            path,
+                            &OrderTimelineReport {
+                                order_id: order_id.clone(),
+                                create_attempt_at_secs,
+                                create_success: true,
+                                source_init_after_secs,
+                                destination_init_after_secs,
+                                destination_redeem_after_secs,
+                                source_redeem_after_secs,
+                                final_status: "pending".to_string(),
+                                note: "destination redeem detected".to_string(),
+                                error: String::new(),
+                            },
+                        );
+                    }
+                }
+                if source_redeem_after_secs.is_none() && !s.source_redeem.is_empty() {
+                    source_redeem_after_secs = Some(elapsed);
+                    if let Some(path) = &live_csv_path {
+                        let _ = append_snapshot_row_to_csv_path(
+                            path,
+                            &OrderTimelineReport {
+                                order_id: order_id.clone(),
+                                create_attempt_at_secs,
+                                create_success: true,
+                                source_init_after_secs,
+                                destination_init_after_secs,
+                                destination_redeem_after_secs,
+                                source_redeem_after_secs,
+                                final_status: "pending".to_string(),
+                                note: "source redeem detected".to_string(),
+                                error: String::new(),
+                            },
+                        );
+                    }
+                }
+
+                if source_init_after_secs.is_some()
+                    && destination_init_after_secs.is_some()
+                    && destination_redeem_after_secs.is_some()
+                    && source_redeem_after_secs.is_some()
+                {
+                    break;
+                }
+            }
+            Ok(None) => {
+                consecutive_errors = 0;
+            }
+            Err(e) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    note = format!("status check errors reached {}: {}", MAX_CONSECUTIVE_ERRORS, e);
+                    captured_error = format!("{:#}", e);
+                    break;
+                }
+            }
+        }
+
+        sleep(poll_every).await;
+    }
+
+    let completed = source_init_after_secs.is_some()
+        && destination_init_after_secs.is_some()
+        && destination_redeem_after_secs.is_some()
+        && source_redeem_after_secs.is_some();
+
+    OrderTimelineReport {
+        order_id,
+        create_attempt_at_secs,
+        create_success: true,
+        source_init_after_secs,
+        destination_init_after_secs,
+        destination_redeem_after_secs,
+        source_redeem_after_secs,
+        final_status: if completed {
+            "completed".to_string()
+        } else {
+            "pending".to_string()
+        },
+        note,
+        error: captured_error,
+    }
+}
+
+fn fmt_optional_secs(value: Option<f64>) -> String {
+    match value {
+        Some(v) => format!("{:.2}", v),
+        None => "-".to_string(),
+    }
+}
+
+fn print_timeline_report(rows: &[OrderTimelineReport], total_runtime_secs: f64) {
+    let total = rows.len();
+    let completed = rows.iter().filter(|r| r.final_status == "completed").count();
+    let pending = total.saturating_sub(completed);
+
+    info!("");
+    info!("================== BASELINE TIMELINE REPORT ==================");
+    info!("Runtime: {:.1} minutes", total_runtime_secs / 60.0);
+    info!(
+        "Orders tracked: {} | completed: {} | pending: {}",
+        total, completed, pending
+    );
+    info!("Columns:");
+    info!(
+        "order_id | s-init-after | destination-init-after | destination-redeem-after | source-redeem-after | status | note | error"
+    );
+
+    for row in rows {
+        info!(
+            "{} | {} | {} | {} | {} | {} | {} | {}",
+            row.order_id,
+            fmt_optional_secs(row.source_init_after_secs),
+            fmt_optional_secs(row.destination_init_after_secs),
+            fmt_optional_secs(row.destination_redeem_after_secs),
+            fmt_optional_secs(row.source_redeem_after_secs),
+            row.final_status,
+            row.note,
+            if row.error.is_empty() { "-" } else { &row.error }
+        );
+    }
+
+    info!("===============================================================");
+}
+
+fn write_timeline_report_txt(rows: &[OrderTimelineReport]) -> Result<()> {
+    let mut file = File::create("report.txt")?;
+    writeln!(
+        file,
+        "order_id | s-init-after | destination-init-after | destination-redeem-after | source-redeem-after | status | note | error"
+    )?;
+    for row in rows {
+        writeln!(
+            file,
+            "{} | {} | {} | {} | {} | {} | {} | {}",
+            row.order_id,
+            fmt_optional_secs(row.source_init_after_secs),
+            fmt_optional_secs(row.destination_init_after_secs),
+            fmt_optional_secs(row.destination_redeem_after_secs),
+            fmt_optional_secs(row.source_redeem_after_secs),
+            row.final_status,
+            sanitize_cell(&row.note),
+            sanitize_cell(&row.error),
+        )?;
+    }
+    info!("Report TXT written: report.txt");
+    Ok(())
+}
+
+fn sanitize_cell(s: &str) -> String {
+    s.replace('\n', " | ").replace('\r', " ").replace(',', ";")
 }
 
 // ============================================================================
@@ -1392,736 +2072,3 @@ async fn poll_order_completion_silent(order_id: &str, start_time: Instant) -> Re
     }
 }
 
-// ============================================================================
-// SINGLE ORDER: SOLANA (devnet) → SPARK (0.001 SOL)
-// ============================================================================
-#[allow(dead_code)]
-async fn test_solona_to_spark() -> Result<()> {
-    use base64::Engine;
-    use solana_client::nonblocking::rpc_client::RpcClient as SolanaRpcClient;
-    use solana_sdk::{
-        commitment_config::CommitmentConfig, signature::Keypair, signer::Signer as SolanaSigner,
-        transaction::VersionedTransaction,
-    };
-
-    info!("=== Single Order: Solana (devnet) → Spark (0.001 SOL) ===");
-
-    // 1. Init Spark SDK for destination address
-    let sdk = init_sdk().await?;
-    let spark_address = get_address(&sdk).await?;
-    info!("Spark Destination Address: {}", spark_address);
-
-    // 2. Setup Solana keypair from base58 private key
-    let keypair_bytes = bs58::decode(env_var("SOLANA_PRIVATE_KEY")?)
-        .into_vec()
-        .map_err(|e| eyre!("Failed to decode Solana private key: {}", e))?;
-    let keypair =
-        Keypair::from_bytes(&keypair_bytes).map_err(|e| eyre!("Invalid Solana keypair: {}", e))?;
-    let solana_pubkey = keypair.pubkey();
-    info!("Solana Wallet: {}", solana_pubkey);
-
-    // 3. Setup async Solana RPC client
-    let rpc_client = SolanaRpcClient::new_with_commitment(
-        env_var("SOLANA_DEVNET_RPC")?,
-        CommitmentConfig::confirmed(),
-    );
-
-    // Check balance
-    let balance = rpc_client
-        .get_balance(&solana_pubkey)
-        .await
-        .map_err(|e| eyre!("Failed to get Solana balance: {}", e))?;
-    info!(
-        "Solana Balance: {} lamports ({:.6} SOL)",
-        balance,
-        balance as f64 / 1_000_000_000.0
-    );
-    if balance < 2_000_000 {
-        return Err(eyre!(
-            "Insufficient SOL: {} lamports. Need ~0.002 SOL (0.001 + fees). Use: solana airdrop 1 {} --url devnet",
-            balance,
-            solana_pubkey
-        ));
-    }
-
-    // 4. Get Quote: 0.001 SOL = 1,000,000 lamports
-    let source_asset = "solana_testnet:sol";
-    let dest_asset = "spark:btc";
-    let amount_lamports: u64 = 1_000_000;
-
-    info!(
-        "Fetching quote {} → {} for {} lamports (0.001 SOL)",
-        source_asset, dest_asset, amount_lamports
-    );
-    let quote = get_quote(source_asset, dest_asset, amount_lamports).await?;
-    info!("Quote: {:?}", quote);
-
-    let dest_amount = quote["result"][0]["destination"]["amount"]
-        .as_str()
-        .ok_or_else(|| eyre!("No destination amount in quote: {:?}", quote))?
-        .to_string();
-    info!("Destination amount: {} sats", dest_amount);
-
-    // 5. Create Order
-    info!("Creating Solana → Spark order...");
-    let order = create_order_solana_to_spark(
-        source_asset,
-        &solana_pubkey.to_string(),
-        &amount_lamports.to_string(),
-        dest_asset,
-        &spark_address,
-        &dest_amount,
-    )
-    .await?;
-    info!("Order Created: ID={}", order.order_id);
-
-    // 6. Decode the versioned_tx (API returns base64)
-    info!("Decoding versioned transaction...");
-    let tx_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&order.versioned_tx)
-        .map_err(|e| eyre!("Failed to base64-decode versioned_tx: {}", e))?;
-
-    let mut transaction: VersionedTransaction = bincode::deserialize(&tx_bytes)
-        .map_err(|e| eyre!("Failed to deserialize VersionedTransaction: {}", e))?;
-    info!("Transaction deserialized ({} bytes)", tx_bytes.len());
-
-    // 7. Sign the transaction (replace placeholder signature at index 0)
-    let message_bytes = transaction.message.serialize();
-    let sig = keypair.sign_message(&message_bytes);
-    transaction.signatures[0] = sig;
-    info!("Transaction signed: {}", sig);
-
-    // 8. Send the transaction to Solana devnet
-    let start_time = Instant::now();
-    info!("Sending Solana transaction...");
-
-    let tx_sig = rpc_client
-        .send_and_confirm_transaction(&transaction)
-        .await
-        .map_err(|e| eyre!("Failed to send Solana tx: {}", e))?;
-
-    info!("✅ Solana TX confirmed: {}", tx_sig);
-    info!(
-        "Explorer: https://explorer.solana.com/tx/{}?cluster=devnet",
-        tx_sig
-    );
-
-    // 9. Poll until swap completes on Spark side
-    poll_order_completion(&order.order_id, start_time).await?;
-    info!("=== Single Solana → Spark Complete ===");
-    Ok(())
-}
-
-// ============================================================================
-// SOLANA ORDER CREATION HELPER
-// ============================================================================
-async fn create_order_solana_to_spark(
-    source_asset: &str,
-    source_owner: &str,
-    source_amount: &str,
-    dest_asset: &str,
-    dest_owner: &str,
-    dest_amount: &str,
-) -> Result<SolanaOrderResult> {
-    let url = format!("{}/v2/orders", env_var("API_BASE_URL")?);
-    let client = Client::new();
-    let req = OrderRequest {
-        source: OrderDetails {
-            asset: source_asset.to_string(),
-            owner: source_owner.to_string(),
-            amount: source_amount.to_string(),
-        },
-        destination: OrderDetails {
-            asset: dest_asset.to_string(),
-            owner: dest_owner.to_string(),
-            amount: dest_amount.to_string(),
-        },
-        solver_id: Some("staging-2".to_string()),
-    };
-
-    info!("Order request: {:?}", req);
-    let (status, res_text) = make_order_request_with_retry(&client, &url, &req, 5).await?;
-    info!("Order response: {}", res_text);
-
-    if !status.is_success() {
-        if let Ok(error_res) = serde_json::from_str::<ErrorResponse>(&res_text) {
-            let msg = error_res.message.unwrap_or_else(|| "Unknown".to_string());
-            return Err(eyre!("API error ({}): {}", status, msg));
-        }
-        return Err(eyre!("API failed {}: {}", status, res_text));
-    }
-
-    if let Ok(error_res) = serde_json::from_str::<ErrorResponse>(&res_text) {
-        if error_res.message.is_some() {
-            return Err(eyre!("API error: {}", error_res.message.unwrap()));
-        }
-    }
-
-    let res_json: SolanaOrderResponse = serde_json::from_str(&res_text)
-        .map_err(|e| eyre!("Parse error: {}. Body: {}", e, res_text))?;
-    if res_json.status != "Ok" {
-        return Err(eyre!("Order creation failed: {}", res_json.status));
-    }
-
-    Ok(res_json.result)
-}
-
-// ============================================================================
-// SINGLE ORDER: SOLANA cbBTC (testnet) → SPARK (0.0005 cbBTC)
-// ============================================================================
-#[allow(dead_code)]
-async fn test_solana_cbbtc_to_spark() -> Result<()> {
-    use base64::Engine;
-    use solana_client::nonblocking::rpc_client::RpcClient as SolanaRpcClient;
-    use solana_sdk::{
-        commitment_config::CommitmentConfig, signature::Keypair, signer::Signer as SolanaSigner,
-        transaction::VersionedTransaction,
-    };
-
-    info!("=== Single Order: Solana cbBTC (testnet) → Spark (0.0005 cbBTC) ===");
-
-    // 1. Init Spark SDK for destination address
-    let sdk = init_sdk().await?;
-    let spark_address = get_address(&sdk).await?;
-    info!("Spark Destination Address: {}", spark_address);
-
-    // 2. Setup Solana keypair from base58 private key
-    let keypair_bytes = bs58::decode(env_var("SOLANA_PRIVATE_KEY")?)
-        .into_vec()
-        .map_err(|e| eyre!("Failed to decode Solana private key: {}", e))?;
-    let keypair =
-        Keypair::from_bytes(&keypair_bytes).map_err(|e| eyre!("Invalid Solana keypair: {}", e))?;
-    let solana_pubkey = keypair.pubkey();
-    info!("Solana Wallet: {}", solana_pubkey);
-
-    // 3. Setup Solana RPC client (testnet)
-    let rpc_client = SolanaRpcClient::new_with_commitment(
-        env_var("SOLANA_DEVNET_RPC")?,
-        CommitmentConfig::confirmed(),
-    );
-
-    // Check SOL balance for tx fees
-    let sol_balance = rpc_client
-        .get_balance(&solana_pubkey)
-        .await
-        .map_err(|e| eyre!("Failed to get SOL balance: {}", e))?;
-    info!(
-        "SOL Balance: {} lamports ({:.6} SOL)",
-        sol_balance,
-        sol_balance as f64 / 1_000_000_000.0
-    );
-    if sol_balance < 100_000 {
-        return Err(eyre!(
-            "Insufficient SOL for tx fees: {} lamports. Airdrop with: solana airdrop 1 {} --url testnet",
-            sol_balance,
-            solana_pubkey
-        ));
-    }
-
-    // 4. Get Quote: 0.0005 cbBTC = 50,000 units (8 decimals)
-    let source_asset = "solana_testnet:cbbtc";
-    let dest_asset = "spark:btc";
-    let amount: u64 = 50_000; // 0.0005 cbBTC
-
-    info!(
-        "Fetching quote {} → {} for {} units (0.0005 cbBTC)",
-        source_asset, dest_asset, amount
-    );
-    let quote = get_quote(source_asset, dest_asset, amount).await?;
-    info!("Quote: {:?}", quote);
-
-    let dest_amount = quote["result"][0]["destination"]["amount"]
-        .as_str()
-        .ok_or_else(|| eyre!("No destination amount in quote: {:?}", quote))?
-        .to_string();
-    info!("Destination amount: {} sats", dest_amount);
-
-    // 5. Create Order
-    info!("Creating Solana cbBTC → Spark order...");
-    let order = create_order_solana_to_spark(
-        source_asset,
-        &solana_pubkey.to_string(),
-        &amount.to_string(),
-        dest_asset,
-        &spark_address,
-        &dest_amount,
-    )
-    .await?;
-    info!("Order Created: ID={}", order.order_id);
-
-    // 6. Decode the versioned_tx (base64 from API)
-    info!("Decoding versioned transaction...");
-    let tx_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&order.versioned_tx)
-        .map_err(|e| eyre!("Failed to base64-decode versioned_tx: {}", e))?;
-
-    let mut transaction: VersionedTransaction = bincode::deserialize(&tx_bytes)
-        .map_err(|e| eyre!("Failed to deserialize VersionedTransaction: {}", e))?;
-    info!("Transaction deserialized ({} bytes)", tx_bytes.len());
-
-    // 7. Sign the transaction
-    let message_bytes = transaction.message.serialize();
-    let sig = keypair.sign_message(&message_bytes);
-    transaction.signatures[0] = sig;
-    info!("Transaction signed: {}", sig);
-
-    // 8. Send to Solana testnet
-    let start_time = Instant::now();
-    info!("Sending Solana cbBTC transaction...");
-
-    let tx_sig = rpc_client
-        .send_and_confirm_transaction(&transaction)
-        .await
-        .map_err(|e| eyre!("Failed to send Solana tx: {}", e))?;
-
-    info!("✅ Solana TX confirmed: {}", tx_sig);
-    info!(
-        "Explorer: https://explorer.solana.com/tx/{}?cluster=testnet",
-        tx_sig
-    );
-
-    // 9. Poll until swap completes on Spark side
-    poll_order_completion(&order.order_id, start_time).await?;
-    info!("=== Single Solana cbBTC → Spark Complete ===");
-    Ok(())
-}
-
-// ============================================================================
-// BATCH TEST: SPARK → SOLANA  (N orders × amount_lamports each)
-// ============================================================================
-
-#[allow(dead_code)]
-async fn batch_test_spark_to_solana(total_orders: u32, batch_size: u32) -> Result<BatchTestReport> {
-    
-    
-    use solana_sdk::{
-        signature::Keypair, signer::Signer as SolanaSigner,
-    };
-
-    info!("=== Starting Batch Test: Spark → Solana ===");
-    info!(
-        "Total orders: {}, Batch size: {}, Amount: 1,000,000 lamports (0.001 SOL) each",
-        total_orders, batch_size
-    );
-
-    let mut report = BatchTestReport::new();
-    report.start();
-
-    // 1. Init Spark SDK
-    let sdk = init_sdk().await?;
-    let my_spark_address = get_address(&sdk).await?;
-    info!("My Spark Address: {}", my_spark_address);
-
-    // 2. Solana destination wallet (reuse SOLANA_PRIVATE_KEY as recipient identity,
-    //    or substitute a dedicated destination pubkey string if preferred)
-    let keypair_bytes = bs58::decode(env_var("SOLANA_PRIVATE_KEY")?)
-        .into_vec()
-        .map_err(|e| eyre!("Failed to decode Solana private key: {}", e))?;
-    let keypair =
-        Keypair::from_bytes(&keypair_bytes).map_err(|e| eyre!("Invalid Solana keypair: {}", e))?;
-    let solana_dest_address = keypair.pubkey().to_string();
-    info!("Solana Destination Address: {}", solana_dest_address);
-
-    let source_asset = "spark:btc";
-    let dest_asset = "solana_testnet:sol";
-    let amount_sats: u64 = 10_000; // sats sent from Spark side
-
-    let num_batches = (total_orders + batch_size - 1) / batch_size;
-
-    for batch_num in 0..num_batches {
-        let batch_start = batch_num * batch_size;
-        let batch_end = std::cmp::min(batch_start + batch_size, total_orders);
-
-        info!("");
-        info!(
-            "========== Batch {}/{} (Orders {}-{}) ==========",
-            batch_num + 1,
-            num_batches,
-            batch_start + 1,
-            batch_end
-        );
-
-        let mut order_handles: Vec<(u32, String, Instant)> = Vec::new();
-
-        for order_num in batch_start..batch_end {
-            let order_idx = order_num + 1;
-
-            if order_num > batch_start {
-                sleep(Duration::from_millis(500)).await;
-            }
-
-            info!("[Order {}] Creating Spark → Solana order...", order_idx);
-
-            // Fetch a fresh quote to get the expected destination amount
-            let quote_result = get_quote(source_asset, dest_asset, amount_sats).await;
-            let dest_amount = match quote_result {
-                Ok(q) => q["result"][0]["destination"]["amount"]
-                    .as_str()
-                    .unwrap_or("900000")
-                    .to_string(),
-                Err(e) => {
-                    info!(
-                        "[Order {}] Quote failed, using fallback dest amount: {}",
-                        order_idx, e
-                    );
-                    "900000".to_string() // fallback lamports
-                }
-            };
-
-            match create_order_spark_to_evm(
-                // Garden's v2/orders endpoint is chain-agnostic; reuse the same helper
-                // but point assets at Solana
-                source_asset,
-                &my_spark_address,
-                dest_asset,
-                &solana_dest_address,
-                amount_sats.to_string(),
-                dest_amount,
-            )
-            .await
-            {
-                Ok(order_res) => {
-                    info!(
-                        "[Order {}] Order created: ID={}, To={}, Amount={}",
-                        order_idx, order_res.order_id, order_res.to, order_res.amount
-                    );
-
-                    let amount_val: u64 = match order_res.amount.parse() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            report.record_failure(
-                                order_res.order_id.clone(),
-                                format!("Failed to parse amount: {}", e),
-                            );
-                            continue;
-                        }
-                    };
-
-                    let start_time = Instant::now();
-                    match send_funds(&sdk, &order_res.to, amount_val).await {
-                        Ok(_) => {
-                            info!("[Order {}] Funds sent to {}", order_idx, order_res.to);
-                            order_handles.push((order_idx, order_res.order_id, start_time));
-                        }
-                        Err(e) => {
-                            report.record_failure(
-                                order_res.order_id,
-                                format!("Failed to send funds: {}", e),
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    report.record_failure(
-                        format!("order_{}", order_idx),
-                        format!("Failed to create order: {}", e),
-                    );
-                }
-            }
-        }
-
-        // Poll all orders in this batch
-        for (order_idx, order_id, start_time) in order_handles {
-            info!("[Order {}] Waiting for completion...", order_idx);
-            match poll_order_completion_silent(&order_id, start_time).await {
-                Ok(duration) => {
-                    info!("[Order {}] ✅ Completed in {:.2}s", order_idx, duration);
-                    report.record_success(duration);
-                }
-                Err(e) => {
-                    info!("[Order {}] ❌ Failed: {}", order_idx, e);
-                    report.record_failure(order_id, e.to_string());
-                }
-            }
-        }
-
-        info!(
-            "Batch {} complete. Progress: {}/{} orders processed",
-            batch_num + 1,
-            report.total_orders,
-            total_orders
-        );
-
-        if batch_num + 1 < num_batches {
-            sleep(Duration::from_secs(2)).await;
-        }
-    }
-
-    report.finish();
-    report.print_report("Spark → Solana (10,000 sats × N orders)");
-    info!("=== Batch Test Complete: Spark → Solana ===");
-    Ok(report)
-}
-
-// ============================================================================
-// HELPER: Create order with explicit dest amount (needed for Solana dest)
-// ============================================================================
-
-#[allow(dead_code)]
-async fn create_order_spark_to_solana(
-    source_asset: &str,
-    source_owner: &str,
-    source_amount: String,
-    dest_asset: &str,
-    dest_owner: &str,
-    dest_amount: String,
-) -> Result<CreateOrderResult> {
-    let url = format!("{}/v2/orders", env_var("API_BASE_URL")?);
-    let client = Client::new();
-    let req = OrderRequest {
-        source: OrderDetails {
-            asset: source_asset.to_string(),
-            owner: source_owner.to_string(),
-            amount: source_amount,
-        },
-        destination: OrderDetails {
-            asset: dest_asset.to_string(),
-            owner: dest_owner.to_string(),
-            amount: dest_amount,
-        },
-        solver_id: Some("staging-2".to_string()),
-    };
-    let (status, res_text) = make_order_request_with_retry(&client, &url, &req, 5).await?;
-    if !status.is_success() {
-        if let Ok(error_res) = serde_json::from_str::<ErrorResponse>(&res_text) {
-            let msg = error_res.message.unwrap_or_else(|| "Unknown".to_string());
-            return Err(eyre!("API error ({}): {}", status, msg));
-        }
-        return Err(eyre!("API failed {}: {}", status, res_text));
-    }
-    if let Ok(error_res) = serde_json::from_str::<ErrorResponse>(&res_text) {
-        if error_res.message.is_some() {
-            return Err(eyre!("API error: {}", error_res.message.unwrap()));
-        }
-    }
-    let res_json: CreateOrderResponse = serde_json::from_str(&res_text)
-        .map_err(|e| eyre!("Parse error: {}. Body: {}", e, res_text))?;
-    if res_json.status != "Ok" {
-        return Err(eyre!("Order creation failed: {}", res_json.status));
-    }
-    Ok(res_json.result)
-}
-
-// ============================================================================
-// BATCH TEST: SOLANA → SPARK  (N orders × 1,000,000 lamports each)
-// ============================================================================
-
-#[allow(dead_code)]
-async fn batch_test_solana_to_spark(total_orders: u32, batch_size: u32) -> Result<BatchTestReport> {
-    use base64::Engine;
-    use solana_client::nonblocking::rpc_client::RpcClient as SolanaRpcClient;
-    use solana_sdk::{
-        commitment_config::CommitmentConfig, signature::Keypair, signer::Signer as SolanaSigner,
-        transaction::VersionedTransaction,
-    };
-
-    info!("=== Starting Batch Test: Solana → Spark ===");
-    info!(
-        "Total orders: {}, Batch size: {}, Amount: 1,000,000 lamports (0.001 SOL) each",
-        total_orders, batch_size
-    );
-
-    let mut report = BatchTestReport::new();
-    report.start();
-
-    // 1. Init Spark SDK for destination address
-    let sdk = init_sdk().await?;
-    let spark_address = get_address(&sdk).await?;
-    info!("Spark Destination Address: {}", spark_address);
-
-    // 2. Setup Solana keypair
-    let keypair_bytes = bs58::decode(env_var("SOLANA_PRIVATE_KEY")?)
-        .into_vec()
-        .map_err(|e| eyre!("Failed to decode Solana private key: {}", e))?;
-    let keypair =
-        Keypair::from_bytes(&keypair_bytes).map_err(|e| eyre!("Invalid Solana keypair: {}", e))?;
-    let solana_pubkey = keypair.pubkey();
-    info!("Solana Wallet: {}", solana_pubkey);
-
-    // 3. Solana RPC client
-    let rpc_client = SolanaRpcClient::new_with_commitment(
-        env_var("SOLANA_DEVNET_RPC")?,
-        CommitmentConfig::confirmed(),
-    );
-
-    // Pre-flight balance check
-    let balance = rpc_client
-        .get_balance(&solana_pubkey)
-        .await
-        .map_err(|e| eyre!("Failed to get Solana balance: {}", e))?;
-    let lamports_per_order: u64 = 1_000_000;
-    let estimated_fees_per_order: u64 = 10_000; // rough fee estimate
-    let required = (lamports_per_order + estimated_fees_per_order) * total_orders as u64;
-    info!(
-        "Solana Balance: {} lamports ({:.6} SOL) | Required ~{} lamports",
-        balance,
-        balance as f64 / 1_000_000_000.0,
-        required
-    );
-    if balance < required {
-        return Err(eyre!(
-            "Insufficient SOL: {} lamports. Need ~{} lamports for {} orders. Airdrop with: solana airdrop {} {} --url devnet",
-            balance,
-            required,
-            total_orders,
-            (required as f64 / 1_000_000_000.0).ceil() as u64,
-            solana_pubkey
-        ));
-    }
-
-    let source_asset = "solana_testnet:sol";
-    let dest_asset = "spark:btc";
-
-    let num_batches = (total_orders + batch_size - 1) / batch_size;
-
-    for batch_num in 0..num_batches {
-        let batch_start = batch_num * batch_size;
-        let batch_end = std::cmp::min(batch_start + batch_size, total_orders);
-
-        info!("");
-        info!(
-            "========== Batch {}/{} (Orders {}-{}) ==========",
-            batch_num + 1,
-            num_batches,
-            batch_start + 1,
-            batch_end
-        );
-
-        // We collect (order_idx, order_id, start_time) for polling after the batch sends
-        let mut order_handles: Vec<(u32, String, Instant)> = Vec::new();
-
-        for order_num in batch_start..batch_end {
-            let order_idx = order_num + 1;
-
-            // Stagger requests slightly to avoid hammering the API
-            if order_num > batch_start {
-                sleep(Duration::from_millis(500)).await;
-            }
-
-            info!("[Order {}] Fetching quote...", order_idx);
-
-            // Get quote for this order
-            let dest_amount = match get_quote(source_asset, dest_asset, lamports_per_order).await {
-                Ok(q) => q["result"][0]["destination"]["amount"]
-                    .as_str()
-                    .unwrap_or("800")
-                    .to_string(),
-                Err(e) => {
-                    info!(
-                        "[Order {}] Quote failed ({}), using fallback dest amount",
-                        order_idx, e
-                    );
-                    "800".to_string() // fallback sats
-                }
-            };
-            info!("[Order {}] Dest amount: {} sats", order_idx, dest_amount);
-
-            info!("[Order {}] Creating Solana → Spark order...", order_idx);
-            match create_order_solana_to_spark(
-                source_asset,
-                &solana_pubkey.to_string(),
-                &lamports_per_order.to_string(),
-                dest_asset,
-                &spark_address,
-                &dest_amount,
-            )
-            .await
-            {
-                Ok(order_res) => {
-                    info!(
-                        "[Order {}] Order created: ID={}",
-                        order_idx, order_res.order_id
-                    );
-
-                    // Decode versioned transaction returned by the API
-                    let tx_bytes = match base64::engine::general_purpose::STANDARD
-                        .decode(&order_res.versioned_tx)
-                    {
-                        Ok(b) => b,
-                        Err(e) => {
-                            report.record_failure(
-                                order_res.order_id,
-                                format!("Failed to base64-decode versioned_tx: {}", e),
-                            );
-                            continue;
-                        }
-                    };
-
-                    let mut transaction: VersionedTransaction =
-                        match bincode::deserialize(&tx_bytes) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                report.record_failure(
-                                    order_res.order_id,
-                                    format!("Failed to deserialize VersionedTransaction: {}", e),
-                                );
-                                continue;
-                            }
-                        };
-
-                    // Sign
-                    let message_bytes = transaction.message.serialize();
-                    let sig = keypair.sign_message(&message_bytes);
-                    transaction.signatures[0] = sig;
-                    info!("[Order {}] Transaction signed: {}", order_idx, sig);
-
-                    // Send to Solana
-                    let start_time = Instant::now();
-                    match rpc_client.send_and_confirm_transaction(&transaction).await {
-                        Ok(tx_sig) => {
-                            info!(
-                                "[Order {}] ✅ Solana TX confirmed: {} (Explorer: https://explorer.solana.com/tx/{}?cluster=devnet)",
-                                order_idx, tx_sig, tx_sig
-                            );
-                            order_handles.push((order_idx, order_res.order_id, start_time));
-                        }
-                        Err(e) => {
-                            report.record_failure(
-                                order_res.order_id,
-                                format!("Solana tx failed: {}", e),
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    report.record_failure(
-                        format!("order_{}", order_idx),
-                        format!("Failed to create order: {}", e),
-                    );
-                }
-            }
-        }
-
-        // Poll all orders in this batch for Garden swap completion
-        for (order_idx, order_id, start_time) in order_handles {
-            info!("[Order {}] Waiting for swap completion...", order_idx);
-            match poll_order_completion_silent(&order_id, start_time).await {
-                Ok(duration) => {
-                    info!("[Order {}] ✅ Completed in {:.2}s", order_idx, duration);
-                    report.record_success(duration);
-                }
-                Err(e) => {
-                    info!("[Order {}] ❌ Failed: {}", order_idx, e);
-                    report.record_failure(order_id, e.to_string());
-                }
-            }
-        }
-
-        info!(
-            "Batch {} complete. Progress: {}/{} orders processed",
-            batch_num + 1,
-            report.total_orders,
-            total_orders
-        );
-
-        // Brief pause between batches to respect rate limits
-        if batch_num + 1 < num_batches {
-            sleep(Duration::from_secs(2)).await;
-        }
-    }
-
-    report.finish();
-    report.print_report("Solana → Spark (0.001 SOL × N orders)");
-    info!("=== Batch Test Complete: Solana → Spark ===");
-    Ok(report)
-}
